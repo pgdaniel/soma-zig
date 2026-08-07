@@ -23,7 +23,7 @@ export function play(url, channel, metadataCallback) {
   onTrackChange = metadataCallback;
   playerState = { playing: true, channel };
 
-  currentProcess = spawn("mpv", [
+  const proc = spawn("mpv", [
     "--no-video",
     "--really-quiet",
     "--volume=80",
@@ -33,12 +33,14 @@ export function play(url, channel, metadataCallback) {
     url,
   ]);
 
-  currentProcess.stdout?.on("data", (data) => {
+  currentProcess = proc;
+
+  proc.stdout?.on("data", (data) => {
     const output = data.toString();
     if (onTrackChange) onTrackChange(output);
   });
 
-  currentProcess.stderr?.on("data", (data) => {
+  proc.stderr?.on("data", (data) => {
     const output = data.toString();
     const titleMatch = output.match(/icy-title:\s*(.+)/i);
     if (titleMatch && onTrackChange) {
@@ -50,19 +52,23 @@ export function play(url, channel, metadataCallback) {
     }
   });
 
-  currentProcess.on("exit", () => {
-    playerState.playing = false;
-    playerState.channel = null;
-    currentProcess = null;
+  proc.on("exit", () => {
+    if (currentProcess === proc) {
+      playerState.playing = false;
+      playerState.channel = null;
+      currentProcess = null;
+    }
   });
 
-  currentProcess.on("error", (err) => {
+  proc.on("error", (err) => {
     console.error("mpv error:", err.message);
-    playerState.playing = false;
-    currentProcess = null;
+    if (currentProcess === proc) {
+      playerState.playing = false;
+      currentProcess = null;
+    }
   });
 
-  return currentProcess;
+  return proc;
 }
 
 export function stop() {
