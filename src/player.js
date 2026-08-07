@@ -4,6 +4,19 @@ let currentProcess = null;
 let onTrackChange = null;
 let playerState = { playing: false, channel: null };
 
+function cleanup() {
+  if (currentProcess) {
+    currentProcess.kill("SIGKILL");
+    currentProcess = null;
+  }
+  playerState.playing = false;
+  playerState.channel = null;
+}
+
+process.once("SIGINT", () => { cleanup(); process.exit(0); });
+process.once("SIGTERM", () => { cleanup(); process.exit(0); });
+process.on("exit", cleanup);
+
 export function play(url, channel, metadataCallback) {
   stop();
 
