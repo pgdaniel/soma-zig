@@ -12,6 +12,7 @@ const INFO_H = 8;
 
 pub const App = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     term: tui.Term,
     player: *Player,
     client: std.http.Client,
@@ -30,13 +31,14 @@ pub const App = struct {
     status_buf: [256]u8 = undefined,
     status_len: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator) !*App {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !*App {
         const self = try allocator.create(App);
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .term = try tui.Term.init(allocator),
-            .player = try Player.init(allocator),
-            .client = .{ .allocator = allocator },
+            .player = try Player.init(allocator, io),
+            .client = .{ .allocator = allocator, .io = io },
             .channel_arena = std.heap.ArenaAllocator.init(allocator),
             .frame_arena = std.heap.ArenaAllocator.init(allocator),
         };
@@ -79,7 +81,7 @@ pub const App = struct {
                 }
                 self.draw();
             }
-            const now = std.time.milliTimestamp();
+            const now = std.Io.Clock.awake.now(self.io).toMilliseconds();
             if (now - self.last_viz_ms >= 80) {
                 self.last_viz_ms = now;
                 self.draw();
@@ -136,7 +138,9 @@ pub const App = struct {
         };
         // Fresh visualizer with a random pattern, like the JS version.
         if (self.viz) |*v| {
-            var rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp() & 0x7fffffffffffffff));
+            var seed: u64 = undefined;
+            std.Io.random(self.io, std.mem.asBytes(&seed));
+            var rng = std.Random.DefaultPrng.init(seed);
             v.pattern = visualizer.Pattern.random(rng.random());
             v.reset();
         }
@@ -364,7 +368,9 @@ pub const App = struct {
 
         const bars = @max(8, @min(64, inner_w));
         if (self.viz == null) {
-            self.viz = visualizer.Visualizer.init(self.allocator, bars, inner_h, .waves) catch return;
+            var seed: u64 = undefined;
+            std.Io.random(self.io, std.mem.asBytes(&seed));
+            self.viz = visualizer.Visualizer.init(self.allocator, bars, inner_h, .waves, seed) catch return;
         }
         if (self.viz.?.bars != bars or self.viz.?.height != inner_h) {
             self.viz.?.resize(self.allocator, bars, inner_h) catch return;

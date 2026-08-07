@@ -18,6 +18,7 @@ const PCM_RING_CAP = SAMPLE_RATE * CHANNELS * 2;
 
 pub const Player = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
 
     byte_ring: ByteRing,
     pcm_ring: PcmRing,
@@ -27,10 +28,10 @@ pub const Player = struct {
 
     /// Device pointer is owned by the decoder thread; guarded by device_mutex
     /// so the UI thread can retarget volume changes safely.
-    device_mutex: std.Thread.Mutex = .{},
+    device_mutex: std.Io.Mutex = .init,
     device: ?*c.ma_device = null,
 
-    state_mutex: std.Thread.Mutex = .{},
+    state_mutex: std.Io.Mutex = .init,
     playing: bool = false,
     connecting: bool = false,
     volume: u8 = 80,
@@ -62,14 +63,15 @@ pub const Player = struct {
         message: []const u8,
     };
 
-    pub fn init(allocator: std.mem.Allocator) !*Player {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !*Player {
         const self = try allocator.create(Player);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .byte_ring = try ByteRing.init(allocator, BYTE_RING_CAP),
-            .pcm_ring = try PcmRing.init(allocator, PCM_RING_CAP),
-            .cache = std.ArrayList(u8).init(allocator),
+            .io = io,
+            .byte_ring = try ByteRing.init(allocator, BYTE_RING_CAP, io),
+            .pcm_ring = try PcmRing.init(allocator, PCM_RING_CAP, io),
+            .cache = .empty,
         };
         self.setMessage("");
         self.setTrack("");
@@ -81,7 +83,7 @@ pub const Player = struct {
         self.stop();
         self.byte_ring.deinit(self.allocator);
         self.pcm_ring.deinit(self.allocator);
-        self.cache.deinit();
+        self.cache.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -92,9 +94,9 @@ pub const Player = struct {
         if (source.len > self.source_url_buf.len) return error.UrlTooLong;
 
         // Allocate fresh rings first so a failure leaves the old state intact.
-        var new_byte_ring = try ByteRing.init(self.allocator, BYTE_RING_CAP);
+        var new_byte_ring = try ByteRing.init(self.allocator, BYTE_RING_CAP, self.io);
         errdefer new_byte_ring.deinit(self.allocator);
-        var new_pcm_ring = try PcmRing.init(self.allocator, PCM_RING_CAP);
+        var new_pcm_ring = try PcmRing.init(self.allocator, PCM_RING_CAP, self.io);
         errdefer new_pcm_ring.deinit(self.allocator);
 
         self.stop();
@@ -112,10 +114,10 @@ pub const Player = struct {
         self.cache_cursor = 0;
         self.cache_enabled = true;
 
-        self.state_mutex.lock();
+        self.state_mutex.lockUncancelable(self.io);
         self.connecting = true;
         self.playing = false;
-        self.state_mutex.unlock();
+        self.state_mutex.unlock(self.io);
         self.setMessage("Connecting...");
 
         self.net_thread = try std.Thread.spawn(.{}, netThreadMain, .{self});
@@ -133,19 +135,19 @@ pub const Player = struct {
             t.join();
             self.dec_thread = null;
         }
-        self.state_mutex.lock();
+        self.state_mutex.lockUncancelable(self.io);
         self.playing = false;
         self.connecting = false;
-        self.state_mutex.unlock();
+        self.state_mutex.unlock(self.io);
     }
 
     pub fn setVolume(self: *Player, vol: u8) void {
-        self.state_mutex.lock();
+        self.state_mutex.lockUncancelable(self.io);
         self.volume = vol;
-        self.state_mutex.unlock();
+        self.state_mutex.unlock(self.io);
         const gain: f32 = @as(f32, @floatFromInt(vol)) / 100.0;
-        self.device_mutex.lock();
-        defer self.device_mutex.unlock();
+        self.device_mutex.lockUncancelable(self.io);
+        defer self.device_mutex.unlock(self.io);
         if (self.device) |dev| {
             _ = c.ma_device_set_master_volume(dev, gain);
         }
@@ -157,8 +159,8 @@ pub const Player = struct {
         track: *[256]u8,
         message: *[256]u8,
     ) Snapshot {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         @memcpy(channel_title[0..self.channel_title_len], self.channel_title_buf[0..self.channel_title_len]);
         @memcpy(track[0..self.track_len], self.track_buf[0..self.track_len]);
         @memcpy(message[0..self.message_len], self.message_buf[0..self.message_len]);
@@ -173,32 +175,32 @@ pub const Player = struct {
     }
 
     fn setChannelTitle(self: *Player, s: []const u8) void {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         const n = @min(s.len, self.channel_title_buf.len);
         @memcpy(self.channel_title_buf[0..n], s[0..n]);
         self.channel_title_len = n;
     }
 
     fn setTrack(self: *Player, s: []const u8) void {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         const n = @min(s.len, self.track_buf.len);
         @memcpy(self.track_buf[0..n], s[0..n]);
         self.track_len = n;
     }
 
     fn setMessage(self: *Player, s: []const u8) void {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         const n = @min(s.len, self.message_buf.len);
         @memcpy(self.message_buf[0..n], s[0..n]);
         self.message_len = n;
     }
 
     fn setPlaying(self: *Player, playing: bool, connecting: bool) void {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         self.playing = playing;
         self.connecting = connecting;
     }
@@ -221,7 +223,7 @@ pub const Player = struct {
         defer arena_inst.deinit();
         const arena = arena_inst.allocator();
 
-        var client: std.http.Client = .{ .allocator = arena };
+        var client: std.http.Client = .{ .allocator = arena, .io = self.io };
         defer client.deinit();
 
         const source = self.source_url_buf[0..self.source_url_len];
@@ -255,9 +257,7 @@ pub const Player = struct {
     ) !void {
         const uri = try std.Uri.parse(url);
 
-        var header_buf: [16 * 1024]u8 = undefined;
-        var req = try client.open(.GET, uri, .{
-            .server_header_buffer = &header_buf,
+        var req = try client.request(.GET, uri, .{
             .extra_headers = &.{
                 .{ .name = "Icy-MetaData", .value = "1" },
                 .{ .name = "User-Agent", .value = "soma-zig/1.0" },
@@ -265,17 +265,17 @@ pub const Player = struct {
         });
         defer req.deinit();
 
-        try req.send();
-        try req.finish();
-        try req.wait();
+        try req.sendBodiless();
+        var redirect_buf: [8 * 1024]u8 = undefined;
+        var res = try req.receiveHead(&redirect_buf);
 
-        switch (req.response.status) {
+        switch (res.head.status) {
             .ok, .partial_content => {},
             else => return error.StreamHttpError,
         }
 
         var metaint: usize = 0;
-        var it = req.response.iterateHeaders();
+        var it = res.head.iterateHeaders();
         while (it.next()) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "icy-metaint")) {
                 metaint = std.fmt.parseInt(usize, std.mem.trim(u8, h.value, " "), 10) catch 0;
@@ -287,7 +287,10 @@ pub const Player = struct {
         self.setMessage("");
         self.setPlaying(true, false);
 
-        const reader = req.reader();
+        // NB: reader() invalidates the header strings, so it is created only
+        // after the ICY headers above have been consumed.
+        var transfer_buf: [4096]u8 = undefined;
+        const reader = res.reader(&transfer_buf);
         var chunk: [16384]u8 = undefined;
         var until_meta: usize = metaint; // bytes of audio left before a metadata block
 
@@ -301,7 +304,7 @@ pub const Player = struct {
                 }
                 want = @min(want, until_meta);
             }
-            const n = reader.read(chunk[0..want]) catch return error.StreamReadError;
+            const n = reader.readSliceShort(chunk[0..want]) catch return error.StreamReadError;
             if (n == 0) {
                 self.setMessage("Stream ended");
                 self.setPlaying(false, false);
@@ -317,13 +320,13 @@ pub const Player = struct {
 
     fn readIcyMetadata(self: *Player, reader: anytype) !void {
         var len_byte: [1]u8 = undefined;
-        const got = reader.readAll(&len_byte) catch return error.MetadataReadError;
+        const got = reader.readSliceShort(&len_byte) catch return error.MetadataReadError;
         if (got == 0) return error.MetadataReadError;
         const meta_len: usize = @as(usize, len_byte[0]) * 16;
         if (meta_len == 0) return;
         var meta_buf: [4096]u8 = undefined;
         if (meta_len > meta_buf.len) return error.MetadataTooLarge;
-        reader.readNoEof(meta_buf[0..meta_len]) catch return error.MetadataReadError;
+        reader.readSliceAll(meta_buf[0..meta_len]) catch return error.MetadataReadError;
         const meta = std.mem.sliceTo(meta_buf[0..meta_len], 0);
 
         if (extractIcyValue(meta, "StreamTitle='")) |title| {
@@ -372,7 +375,7 @@ pub const Player = struct {
                 break :blk 0;
             };
             if (n > 0) {
-                self.cache.appendSlice(slice[0..n]) catch {
+                self.cache.appendSlice(self.allocator, slice[0..n]) catch {
                     // OOM: stop caching; backward seeks will start failing.
                     self.cache_enabled = false;
                 };
@@ -451,14 +454,14 @@ pub const Player = struct {
         defer c.ma_device_uninit(&device);
 
         {
-            self.device_mutex.lock();
-            defer self.device_mutex.unlock();
+            self.device_mutex.lockUncancelable(self.io);
+            defer self.device_mutex.unlock(self.io);
             self.device = &device;
         }
         defer {
-            self.device_mutex.lock();
+            self.device_mutex.lockUncancelable(self.io);
             self.device = null;
-            self.device_mutex.unlock();
+            self.device_mutex.unlock(self.io);
         }
 
         self.setVolume(self.snapshotVolume());
@@ -482,8 +485,8 @@ pub const Player = struct {
     }
 
     fn snapshotVolume(self: *Player) u8 {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         return self.volume;
     }
 };
