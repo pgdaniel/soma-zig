@@ -376,9 +376,12 @@ pub const App = struct {
             self.viz.?.resize(self.allocator, bars, inner_h) catch return;
         }
 
+        var window: [player_mod.VIZ_WINDOW]f32 = undefined;
+        const has_audio = self.player.vizWindow(&window);
+
         _ = self.frame_arena.reset(.retain_capacity);
         const alloc = self.frame_arena.allocator();
-        const lines = self.viz.?.render(alloc) catch return;
+        const lines = self.viz.?.render(alloc, if (has_audio) window[0..] else null, player_mod.SAMPLE_RATE) catch return;
         for (lines, 0..) |line, i| {
             if (i >= inner_h) break;
             term.moveTo(lay.viz_row + 1 + i, lay.side_col + 1);

@@ -31,26 +31,44 @@ pub const Pattern = enum {
 
 const ansi_colors = [_][]const u8{ "36", "34", "35", "31", "33", "32" }; // cyan blue magenta red yellow green
 
-/// Fake-but-pretty animated visualizer, mirroring the JS version. Renders
-/// rows of ANSI-colored unicode block characters.
+const FREQ_MIN: f64 = 50.0; // Hz, low end of the analyzed band range
+const FREQ_MAX: f64 = 16000.0; // Hz, high end (well below typical stream Nyquist)
+
+/// Audio-reactive visualizer. Every pattern is driven by real PCM samples
+/// captured from what's actually playing (see Player.vizWindow): bars,
+/// spectrum, columns and mondrian read per-frequency-band energy via the
+/// Goertzel algorithm; waves traces the raw time-domain waveform; pulse
+/// tracks overall RMS loudness. With no audio (nothing playing yet), levels
+/// decay to silence instead of faking motion.
 pub const Visualizer = struct {
     bars: usize,
     height: usize,
     pattern: Pattern,
-    values: []f64,
-    targets: []f64,
+    values: []f64, // smoothed per-bar spectrum energy, 0..1
+    targets: []f64, // latest raw per-bar spectrum energy, 0..1
+    peak: []f64, // per-bar peak-hold level, 0..1, decays over time
     frame_count: u64 = 0,
     color_index: u64 = 0,
     current_color: []const u8 = "36",
     rng: std.Random.DefaultPrng,
+    gain_band: f64 = 0.02, // auto-gain ceiling for per-band spectrum energy
+    gain_rms: f64 = 0.02, // auto-gain ceiling for overall RMS loudness
+    level: f64 = 0, // smoothed overall loudness, 0..1 (drives `.pulse`)
 
     pub fn init(allocator: std.mem.Allocator, bars: usize, height: usize, pattern: Pattern, seed: u64) !Visualizer {
+        const values = try allocator.alloc(f64, bars);
+        const targets = try allocator.alloc(f64, bars);
+        const peak = try allocator.alloc(f64, bars);
+        @memset(values, 0);
+        @memset(targets, 0);
+        @memset(peak, 0);
         return .{
             .bars = bars,
             .height = height,
             .pattern = pattern,
-            .values = try allocator.alloc(f64, bars),
-            .targets = try allocator.alloc(f64, bars),
+            .values = values,
+            .targets = targets,
+            .peak = peak,
             .rng = std.Random.DefaultPrng.init(seed),
         };
     }
@@ -58,94 +76,120 @@ pub const Visualizer = struct {
     pub fn deinit(self: *Visualizer, allocator: std.mem.Allocator) void {
         allocator.free(self.values);
         allocator.free(self.targets);
+        allocator.free(self.peak);
     }
 
     pub fn resize(self: *Visualizer, allocator: std.mem.Allocator, bars: usize, height: usize) !void {
         if (bars != self.bars) {
             self.values = try allocator.realloc(self.values, bars);
             self.targets = try allocator.realloc(self.targets, bars);
+            self.peak = try allocator.realloc(self.peak, bars);
         }
         self.bars = bars;
         self.height = height;
         @memset(self.values, 0);
         @memset(self.targets, 0);
+        @memset(self.peak, 0);
     }
 
     pub fn reset(self: *Visualizer) void {
         @memset(self.values, 0);
         @memset(self.targets, 0);
+        @memset(self.peak, 0);
+        self.level = 0;
+        // Fresh auto-gain reference so a new (possibly quieter/louder)
+        // channel doesn't inherit the old one's loudness ceiling.
+        self.gain_band = 0.02;
+        self.gain_rms = 0.02;
     }
 
-    /// Advance one animation frame and produce the rendered rows.
-    /// Returned lines are owned by `allocator`.
-    pub fn render(self: *Visualizer, allocator: std.mem.Allocator) ![][]const u8 {
-        self.generateTargets();
-        self.smoothValues();
+    /// Advance one animation frame from a rolling window of real mono PCM
+    /// samples (or null if nothing is playing yet) and produce the
+    /// rendered rows. Returned lines are owned by `allocator`.
+    pub fn render(self: *Visualizer, allocator: std.mem.Allocator, samples: ?[]const f32, sample_rate: f64) ![][]const u8 {
         self.frame_count += 1;
 
-        if (self.pattern == .mondrian) return self.renderMondrian(allocator);
-        if (self.pattern == .columns) return self.renderColumns(allocator);
+        if (samples) |s| {
+            switch (self.pattern) {
+                .waves => {}, // oscilloscope reads the raw window directly
+                .pulse => self.level += (self.analyzeLevel(s) - self.level) * 0.3,
+                else => {
+                    try self.analyzeSpectrum(allocator, s, sample_rate);
+                    self.smoothValues();
+                    self.updatePeaks();
+                },
+            }
+        } else {
+            // No audio yet: decay toward silence rather than faking motion.
+            @memset(self.targets, 0);
+            self.smoothValues();
+            self.level *= 0.9;
+            for (self.peak) |*p| p.* = @max(0, p.* - 0.02);
+        }
 
         if (self.color_index % 8 == 0) {
             self.current_color = ansi_colors[self.rng.random().uintLessThan(usize, ansi_colors.len)];
         }
         self.color_index += 1;
 
-        var lines = try allocator.alloc([]const u8, self.height);
-        for (0..self.height) |row| {
-            var line: std.ArrayList(u8) = .empty;
-            try line.print(allocator, "\x1b[{s}m", .{self.current_color});
-            for (0..self.bars) |i| {
-                const bar_h = self.values[i] * @as(f64, @floatFromInt(self.height));
-                const bar_pos = bar_h - @as(f64, @floatFromInt(row));
-                if (bar_pos >= 0.9) {
-                    try line.appendSlice(allocator, "█");
-                } else if (bar_pos >= 0.75) {
-                    try line.appendSlice(allocator, "▇");
-                } else if (bar_pos >= 0.5) {
-                    try line.appendSlice(allocator, "▅");
-                } else if (bar_pos >= 0.25) {
-                    try line.appendSlice(allocator, "▃");
-                } else if (bar_pos > 0) {
-                    try line.appendSlice(allocator, "▁");
-                } else {
-                    try line.appendSlice(allocator, " ");
-                }
-            }
-            try line.appendSlice(allocator, "\x1b[0m");
-            lines[row] = line.items;
-        }
-        return lines;
+        return switch (self.pattern) {
+            .mondrian => self.renderMondrian(allocator),
+            .columns => self.renderColumns(allocator),
+            .spectrum => self.renderSpectrum(allocator),
+            .waves => self.renderWaves(allocator, samples),
+            .pulse => self.renderPulse(allocator),
+            .bars => self.renderBars(allocator),
+        };
     }
 
-    fn generateTargets(self: *Visualizer) void {
-        const rng = self.rng.random();
-        const t = @as(f64, @floatFromInt(self.frame_count)) * 0.15;
-        const bars_f: f64 = @floatFromInt(self.bars);
+    /// Real per-band frequency energy (Goertzel algorithm, Hann-windowed,
+    /// log-spaced bands from FREQ_MIN to FREQ_MAX, auto-gained to 0..1)
+    /// from a raw mono PCM window. This is the shared spectrum data source
+    /// for bars, spectrum, columns, and mondrian.
+    fn analyzeSpectrum(self: *Visualizer, allocator: std.mem.Allocator, samples: []const f32, sample_rate: f64) !void {
+        const n = samples.len;
+        if (n < 2) return;
+        const windowed = try allocator.alloc(f64, n);
+        defer allocator.free(windowed);
+        const n_f: f64 = @floatFromInt(n);
+        for (windowed, 0..) |*w, i| {
+            // Hann window tames spectral leakage between adjacent bands.
+            const hann = 0.5 - 0.5 * @cos(2.0 * std.math.pi * @as(f64, @floatFromInt(i)) / (n_f - 1));
+            w.* = @as(f64, samples[i]) * hann;
+        }
 
+        const fmax = @min(FREQ_MAX, sample_rate * 0.45);
+        var peak_mag: f64 = 0;
         for (0..self.bars) |i| {
-            const fi: f64 = @floatFromInt(i);
-            var val: f64 = switch (self.pattern) {
-                .waves => (@sin(t + fi * 0.3) * 0.5 + 0.5) * (@sin(fi * 0.5 + t * 0.7) * 0.5 + 0.7),
-                .pulse => @abs(@sin(t - fi * 0.15)) * (0.4 + @sin(fi * 0.4) * 0.3),
-                .bars => @abs(@sin(t * 1.3 + fi * 0.25)) * (0.3 + rng.float(f64) * 0.7),
-                // columns reuses the same bass/mid/treble band shape as
-                // spectrum; only the rendering differs.
-                .spectrum, .columns => blk: {
-                    const bass = @sin(t * 0.8) * 0.5 + 0.5;
-                    const mid = @sin(t * 1.5 + fi * 0.2) * 0.4 + 0.4;
-                    break :blk if (fi < bars_f * 0.25)
-                        bass * (1 - fi / (bars_f * 0.25)) * 0.8
-                    else if (fi < bars_f * 0.6)
-                        mid * 0.6
-                    else
-                        mid * (1 - (fi - bars_f * 0.6) / (bars_f * 0.4)) * 0.4;
-                },
-                // Slow, smooth waves; the Mondrian layout reacts to band averages.
-                .mondrian => @abs(@sin(t * 0.9 + fi * 0.2)) * (0.35 + 0.5 * @abs(@sin(t * 0.5 + fi * 0.05))),
-            };
-            val = @max(0.05, @min(1.0, val + rng.float(f64) * 0.1));
-            self.targets[i] = val;
+            const freq = bandFreq(i, self.bars, FREQ_MIN, fmax);
+            const mag = goertzelMag(windowed, sample_rate, freq);
+            self.targets[i] = mag;
+            peak_mag = @max(peak_mag, mag);
+        }
+
+        // Auto-gain: track a ceiling that snaps up fast on louder peaks and
+        // decays slowly, so quiet and loud streams both fill the display.
+        self.gain_band = if (peak_mag > self.gain_band) peak_mag else self.gain_band * 0.97 + peak_mag * 0.03;
+        const ceiling = @max(self.gain_band, 0.0008);
+        for (self.targets) |*v| {
+            // sqrt gives a perceptual boost to low-level detail.
+            v.* = std.math.clamp(@sqrt(v.* / ceiling), 0, 1);
+        }
+    }
+
+    /// Overall RMS loudness of the window, auto-gained to 0..1.
+    fn analyzeLevel(self: *Visualizer, samples: []const f32) f64 {
+        var sum: f64 = 0;
+        for (samples) |s| sum += @as(f64, s) * @as(f64, s);
+        const rms = @sqrt(sum / @as(f64, @floatFromInt(samples.len)));
+        self.gain_rms = if (rms > self.gain_rms) rms else self.gain_rms * 0.95 + rms * 0.05;
+        const ceiling = @max(self.gain_rms, 0.0008);
+        return std.math.clamp(rms / ceiling, 0, 1);
+    }
+
+    fn updatePeaks(self: *Visualizer) void {
+        for (self.values, self.peak) |v, *p| {
+            p.* = if (v > p.*) v else p.* * 0.96;
         }
     }
 
@@ -156,10 +200,91 @@ pub const Visualizer = struct {
         }
     }
 
+    fn renderBars(self: *Visualizer, allocator: std.mem.Allocator) ![][]const u8 {
+        var lines = try allocator.alloc([]const u8, self.height);
+        for (0..self.height) |row| {
+            var line: std.ArrayList(u8) = .empty;
+            try line.print(allocator, "\x1b[{s}m", .{self.current_color});
+            for (0..self.bars) |i| {
+                try line.appendSlice(allocator, blockGlyph(self.values[i], self.height, row));
+            }
+            try line.appendSlice(allocator, "\x1b[0m");
+            lines[row] = line.items;
+        }
+        return lines;
+    }
+
+    /// Bars plus a bright peak-hold marker line above each one, like a
+    /// classic hardware spectrum analyzer.
+    fn renderSpectrum(self: *Visualizer, allocator: std.mem.Allocator) ![][]const u8 {
+        const h_f: f64 = @floatFromInt(self.height);
+        var lines = try allocator.alloc([]const u8, self.height);
+        for (0..self.height) |row| {
+            var line: std.ArrayList(u8) = .empty;
+            const row_f: f64 = @floatFromInt(row);
+            for (0..self.bars) |i| {
+                const peak_pos = self.peak[i] * h_f - row_f;
+                if (self.peak[i] > 0.03 and peak_pos >= 0 and peak_pos < 1.0) {
+                    try line.appendSlice(allocator, "\x1b[97m▔\x1b[0m");
+                } else {
+                    try line.print(allocator, "\x1b[{s}m{s}\x1b[0m", .{ self.current_color, blockGlyph(self.values[i], self.height, row) });
+                }
+            }
+            lines[row] = line.items;
+        }
+        return lines;
+    }
+
+    /// Single full-width block whose height tracks overall RMS loudness —
+    /// a simple real VU meter rather than a per-frequency display.
+    fn renderPulse(self: *Visualizer, allocator: std.mem.Allocator) ![][]const u8 {
+        var lines = try allocator.alloc([]const u8, self.height);
+        for (0..self.height) |row| {
+            var line: std.ArrayList(u8) = .empty;
+            try line.print(allocator, "\x1b[{s}m", .{self.current_color});
+            const glyph = blockGlyph(self.level, self.height, row);
+            for (0..self.bars) |_| try line.appendSlice(allocator, glyph);
+            try line.appendSlice(allocator, "\x1b[0m");
+            lines[row] = line.items;
+        }
+        return lines;
+    }
+
+    /// Real oscilloscope trace of the raw time-domain waveform, downsampled
+    /// to `bars` points and centered vertically.
+    fn renderWaves(self: *Visualizer, allocator: std.mem.Allocator, samples: ?[]const f32) ![][]const u8 {
+        const cells = try allocator.alloc(bool, self.bars * self.height);
+        @memset(cells, false);
+
+        if (samples) |s| {
+            const mid: f64 = @as(f64, @floatFromInt(self.height)) / 2.0;
+            const max_row: f64 = @floatFromInt(self.height - 1);
+            for (0..self.bars) |i| {
+                const idx = i * s.len / self.bars;
+                const amp: f64 = s[idx]; // roughly -1..1
+                const row_f = std.math.clamp(mid - amp * mid, 0, max_row);
+                const row: usize = @intFromFloat(row_f);
+                cells[row * self.bars + i] = true;
+            }
+        }
+
+        var lines = try allocator.alloc([]const u8, self.height);
+        for (0..self.height) |row| {
+            var line: std.ArrayList(u8) = .empty;
+            try line.print(allocator, "\x1b[{s}m", .{self.current_color});
+            for (0..self.bars) |i| {
+                try line.appendSlice(allocator, if (cells[row * self.bars + i]) "●" else " ");
+            }
+            try line.appendSlice(allocator, "\x1b[0m");
+            lines[row] = line.items;
+        }
+        return lines;
+    }
+
     /// Piet Mondrian "Composition" style: black grid lines dividing the
     /// canvas into rectangles filled with white and primary colors. The
-    /// divider positions follow the music, colored panes swap primaries
-    /// every ~2s and turn bright on high energy.
+    /// divider positions and pane colors follow real bass/mid/treble
+    /// energy (self.values, populated by analyzeSpectrum).
     fn renderMondrian(self: *Visualizer, allocator: std.mem.Allocator) ![][]const u8 {
         const w = self.bars;
         const h = self.height;
@@ -266,6 +391,50 @@ pub const Visualizer = struct {
         return lines;
     }
 };
+
+/// Sub-character-resolution partial block for a bar at `value` (0..1)
+/// height, at the given `row` (0 = top) of a `height`-row box.
+fn blockGlyph(value: f64, height: usize, row: usize) []const u8 {
+    const bar_h = value * @as(f64, @floatFromInt(height));
+    const bar_pos = bar_h - @as(f64, @floatFromInt(row));
+    if (bar_pos >= 0.9) return "█";
+    if (bar_pos >= 0.75) return "▇";
+    if (bar_pos >= 0.5) return "▅";
+    if (bar_pos >= 0.25) return "▃";
+    if (bar_pos > 0) return "▁";
+    return " ";
+}
+
+/// Goertzel algorithm: magnitude of `samples` at `freq` Hz, normalized by
+/// window length. Cheaper than a full FFT when only a handful of specific
+/// frequencies (one per visual bar) are needed rather than the full
+/// spectrum.
+fn goertzelMag(samples: []const f64, sample_rate: f64, freq: f64) f64 {
+    const n: f64 = @floatFromInt(samples.len);
+    const k = @round((n * freq) / sample_rate);
+    const w = (2.0 * std.math.pi / n) * k;
+    const cosine = @cos(w);
+    const coeff = 2.0 * cosine;
+    var q0: f64 = 0;
+    var q1: f64 = 0;
+    var q2: f64 = 0;
+    for (samples) |s| {
+        q0 = coeff * q1 - q2 + s;
+        q2 = q1;
+        q1 = q0;
+    }
+    const real = q1 - q2 * cosine;
+    const imag = q2 * @sin(w);
+    return @sqrt(real * real + imag * imag) / n;
+}
+
+/// Log-spaced center frequency for band `i` of `bars`, matching how real
+/// spectrum analyzers allot more bars to bass than treble.
+fn bandFreq(i: usize, bars: usize, fmin: f64, fmax: f64) f64 {
+    if (bars <= 1) return fmin;
+    const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(bars - 1));
+    return fmin * std.math.pow(f64, fmax / fmin, t);
+}
 
 fn avg(vals: []const f64) f64 {
     if (vals.len == 0) return 0;

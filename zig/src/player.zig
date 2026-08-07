@@ -9,12 +9,15 @@ const c = @cImport({
 const ByteRing = ring_mod.Ring(u8);
 const PcmRing = ring_mod.Ring(f32);
 
-const SAMPLE_RATE = 44100;
+pub const SAMPLE_RATE = 44100;
 const CHANNELS = 2;
 /// ~1 MiB of compressed stream (~60 s at 128 kbps).
 const BYTE_RING_CAP = 1 * 1024 * 1024;
 /// ~2 s of decoded stereo f32 audio.
 const PCM_RING_CAP = SAMPLE_RATE * CHANNELS * 2;
+/// Rolling mono window handed to the visualizer: ~46 ms at 44.1 kHz, long
+/// enough to resolve bass frequencies but short enough to feel live.
+pub const VIZ_WINDOW = 2048;
 
 pub const Player = struct {
     allocator: std.mem.Allocator,
@@ -22,6 +25,14 @@ pub const Player = struct {
 
     byte_ring: ByteRing,
     pcm_ring: PcmRing,
+
+    /// Rolling capture of the most recently *played* audio, downmixed to
+    /// mono, for the visualizer to analyze. Written from the real-time
+    /// audio callback, read from the UI thread — guarded by viz_mutex.
+    viz_mutex: std.Io.Mutex = .init,
+    viz_ring: [VIZ_WINDOW]f32 = [_]f32{0} ** VIZ_WINDOW,
+    viz_write: usize = 0,
+    viz_filled: bool = false,
 
     net_thread: ?std.Thread = null,
     dec_thread: ?std.Thread = null,
@@ -104,6 +115,13 @@ pub const Player = struct {
         self.pcm_ring.deinit(self.allocator);
         self.byte_ring = new_byte_ring;
         self.pcm_ring = new_pcm_ring;
+
+        self.viz_mutex.lockUncancelable(self.io);
+        @memset(&self.viz_ring, 0);
+        self.viz_write = 0;
+        self.viz_filled = false;
+        self.viz_mutex.unlock(self.io);
+
         @memcpy(self.source_url_buf[0..source.len], source);
         self.source_url_len = source.len;
         self.setChannelTitle(channel_title);
@@ -406,6 +424,35 @@ pub const Player = struct {
         const out: [*]f32 = @ptrCast(@alignCast(output.?));
         const n = self.pcm_ring.popTry(out[0..total]);
         if (n < total) @memset(out[n..total], 0); // underrun: silence
+        self.captureViz(out[0..total]);
+    }
+
+    /// Downmix interleaved stereo frames to mono and stash them in the
+    /// rolling viz window. Called from the real-time audio callback, so
+    /// this mirrors exactly what's audible right now (including silence on
+    /// underrun) rather than what's merely been decoded.
+    fn captureViz(self: *Player, interleaved: []const f32) void {
+        self.viz_mutex.lockUncancelable(self.io);
+        defer self.viz_mutex.unlock(self.io);
+        var i: usize = 0;
+        while (i + 1 < interleaved.len) : (i += CHANNELS) {
+            self.viz_ring[self.viz_write] = (interleaved[i] + interleaved[i + 1]) * 0.5;
+            self.viz_write = (self.viz_write + 1) % VIZ_WINDOW;
+        }
+        self.viz_filled = true;
+    }
+
+    /// Copy the most recent VIZ_WINDOW mono samples (oldest -> newest) into
+    /// `out`. Returns false if no audio has played yet (buffer still all
+    /// silence/undefined), so callers can render true silence instead.
+    pub fn vizWindow(self: *Player, out: *[VIZ_WINDOW]f32) bool {
+        self.viz_mutex.lockUncancelable(self.io);
+        defer self.viz_mutex.unlock(self.io);
+        if (!self.viz_filled) return false;
+        const w = self.viz_write;
+        @memcpy(out[0 .. VIZ_WINDOW - w], self.viz_ring[w..]);
+        @memcpy(out[VIZ_WINDOW - w ..], self.viz_ring[0..w]);
+        return true;
     }
 
     fn seekProc(dec: ?*c.ma_decoder, offset: c.ma_int64, origin: c.ma_seek_origin) callconv(.c) c.ma_result {
