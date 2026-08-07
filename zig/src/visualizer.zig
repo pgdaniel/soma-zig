@@ -6,6 +6,7 @@ pub const Pattern = enum {
     bars,
     spectrum,
     columns,
+    vintage,
     mondrian,
 
     pub fn name(self: Pattern) []const u8 {
@@ -18,13 +19,14 @@ pub const Pattern = enum {
             .pulse => .bars,
             .bars => .spectrum,
             .spectrum => .columns,
-            .columns => .mondrian,
+            .columns => .vintage,
+            .vintage => .mondrian,
             .mondrian => .waves,
         };
     }
 
     pub fn random(rng: std.Random) Pattern {
-        const all = [_]Pattern{ .waves, .pulse, .bars, .spectrum, .columns, .mondrian };
+        const all = [_]Pattern{ .waves, .pulse, .bars, .spectrum, .columns, .vintage, .mondrian };
         return all[rng.uintLessThan(usize, all.len)];
     }
 };
@@ -135,6 +137,7 @@ pub const Visualizer = struct {
         return switch (self.pattern) {
             .mondrian => self.renderMondrian(allocator),
             .columns => self.renderColumns(allocator),
+            .vintage => self.renderVintage(allocator),
             .spectrum => self.renderSpectrum(allocator),
             .waves => self.renderWaves(allocator, samples),
             .pulse => self.renderPulse(allocator),
@@ -221,9 +224,9 @@ pub const Visualizer = struct {
         var lines = try allocator.alloc([]const u8, self.height);
         for (0..self.height) |row| {
             var line: std.ArrayList(u8) = .empty;
-            const row_f: f64 = @floatFromInt(row);
+            const from_bottom: f64 = @floatFromInt(self.height - 1 - row);
             for (0..self.bars) |i| {
-                const peak_pos = self.peak[i] * h_f - row_f;
+                const peak_pos = self.peak[i] * h_f - from_bottom;
                 if (self.peak[i] > 0.03 and peak_pos >= 0 and peak_pos < 1.0) {
                     try line.appendSlice(allocator, "\x1b[97m▔\x1b[0m");
                 } else {
@@ -382,7 +385,7 @@ pub const Visualizer = struct {
                     continue;
                 }
                 const bar_h = self.values[i] * @as(f64, @floatFromInt(self.height));
-                const bar_pos = bar_h - @as(f64, @floatFromInt(row));
+                const bar_pos = bar_h - @as(f64, @floatFromInt(self.height - 1 - row));
                 try line.appendSlice(allocator, if (bar_pos >= 0.5) "█" else " ");
             }
             try line.appendSlice(allocator, "\x1b[0m");
@@ -390,13 +393,63 @@ pub const Visualizer = struct {
         }
         return lines;
     }
+
+    /// 70s-audiophile graphic-equalizer look: chunky amber LED rungs
+    /// stacked in a ladder (gap row between each), with unlit segments
+    /// still dimly visible so the whole faceplate shows, a red zone at the
+    /// top for clipping, and a bright hanging peak-hold LED — like a
+    /// vintage Pioneer or Realistic spectrum display.
+    fn renderVintage(self: *Visualizer, allocator: std.mem.Allocator) ![][]const u8 {
+        const amber_lit = "1;33";
+        const amber_dim = "2;33";
+        const red_lit = "1;31";
+        const red_dim = "2;31";
+        const peak_color = "1;97";
+        const h_f: f64 = @floatFromInt(self.height);
+
+        var lines = try allocator.alloc([]const u8, self.height);
+        for (0..self.height) |row| {
+            var line: std.ArrayList(u8) = .empty;
+            // Every other row is the dark gap between LED rungs.
+            if (row % 2 == 1) {
+                for (0..self.bars) |_| try line.appendSlice(allocator, " ");
+                lines[row] = line.items;
+                continue;
+            }
+            const row_f: f64 = @floatFromInt(row);
+            const from_bottom: f64 = @floatFromInt(self.height - 1 - row);
+            const in_red_zone = row_f < h_f * 0.18; // top of the ladder glows red (clip zone)
+            for (0..self.bars) |i| {
+                // Gap column between adjacent LED ladders.
+                if (i % 2 == 1) {
+                    try line.appendSlice(allocator, " ");
+                    continue;
+                }
+                const bar_h = self.values[i] * h_f;
+                const lit = bar_h - from_bottom >= 0.5;
+                const peak_h = self.peak[i] * h_f;
+                const is_peak = self.peak[i] > 0.03 and peak_h - from_bottom >= 0 and peak_h - from_bottom < 2.0;
+                const code = if (is_peak)
+                    peak_color
+                else if (lit)
+                    (if (in_red_zone) red_lit else amber_lit)
+                else
+                    (if (in_red_zone) red_dim else amber_dim);
+                try line.print(allocator, "\x1b[{s}m█\x1b[0m", .{code});
+            }
+            lines[row] = line.items;
+        }
+        return lines;
+    }
 };
 
 /// Sub-character-resolution partial block for a bar at `value` (0..1)
-/// height, at the given `row` (0 = top) of a `height`-row box.
+/// height, at the given `row` (0 = top) of a `height`-row box. Bars fill
+/// from the bottom row upward, like a real meter.
 fn blockGlyph(value: f64, height: usize, row: usize) []const u8 {
     const bar_h = value * @as(f64, @floatFromInt(height));
-    const bar_pos = bar_h - @as(f64, @floatFromInt(row));
+    const from_bottom: f64 = @floatFromInt(height - 1 - row);
+    const bar_pos = bar_h - from_bottom;
     if (bar_pos >= 0.9) return "█";
     if (bar_pos >= 0.75) return "▇";
     if (bar_pos >= 0.5) return "▅";
