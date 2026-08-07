@@ -67,7 +67,7 @@ export function play(url, channel, metadataCallback) {
 
 export function stop() {
   if (currentProcess) {
-    currentProcess.kill("SIGTERM");
+    currentProcess.kill("SIGKILL");
     currentProcess = null;
     playerState.playing = false;
     playerState.channel = null;
