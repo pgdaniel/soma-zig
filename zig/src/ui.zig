@@ -27,6 +27,7 @@ pub const App = struct {
 
     viz: ?visualizer.Visualizer = null,
     last_viz_ms: i64 = 0,
+    fullscreen_viz: bool = false,
 
     status_buf: [256]u8 = undefined,
     status_len: usize = 0,
@@ -72,11 +73,13 @@ pub const App = struct {
                         '+', '=' => self.adjustVolume(5),
                         '-', '_' => self.adjustVolume(-5),
                         'v', 'V' => self.cycleViz(),
+                        'f', 'F' => self.toggleFullscreenViz(),
                         else => {},
                     },
                     .up => self.moveSelection(-1),
                     .down => self.moveSelection(1),
                     .enter, .space => self.playSelected(),
+                    .escape => if (self.fullscreen_viz) self.toggleFullscreenViz(),
                     else => {},
                 }
                 self.draw();
@@ -174,6 +177,11 @@ pub const App = struct {
         }
     }
 
+    fn toggleFullscreenViz(self: *App) void {
+        self.fullscreen_viz = !self.fullscreen_viz;
+        self.setStatus(if (self.fullscreen_viz) "Fullscreen visualizer" else "Normal view");
+    }
+
     fn setStatus(self: *App, msg: []const u8) void {
         const n = @min(msg.len, self.status_buf.len);
         @memcpy(self.status_buf[0..n], msg[0..n]);
@@ -233,9 +241,17 @@ pub const App = struct {
     // Drawing
     // --------------------------------------------------------------
     fn draw(self: *App) void {
-        const lay = self.layout();
         const term = &self.term;
         term.begin();
+        if (self.fullscreen_viz) {
+            const s = term.size();
+            term.clearRegion(1, 1, s.cols, s.rows);
+            self.drawVizFullscreen(s.rows, s.cols);
+            term.reset();
+            term.flush() catch {};
+            return;
+        }
+        const lay = self.layout();
         term.clearRegion(1, 1, lay.cols, lay.rows);
         self.drawHeader(lay);
         self.drawList(lay);
@@ -366,7 +382,7 @@ pub const App = struct {
         const inner_w = if (lay.side_w > 2) lay.side_w - 2 else 1;
         const inner_h = if (lay.viz_h > 2) lay.viz_h - 2 else 1;
 
-        const bars = @max(8, @min(64, inner_w));
+        const bars = @max(8, inner_w);
         if (self.viz == null) {
             var seed: u64 = undefined;
             std.Io.random(self.io, std.mem.asBytes(&seed));
@@ -390,6 +406,36 @@ pub const App = struct {
         term.reset();
     }
 
+    /// Edge-to-edge visualizer: no border, no status row — the pattern
+    /// itself covers every row and column of the terminal.
+    fn drawVizFullscreen(self: *App, rows: usize, cols: usize) void {
+        const term = &self.term;
+
+        const bars = @max(8, cols);
+        const height = @max(1, rows);
+        if (self.viz == null) {
+            var seed: u64 = undefined;
+            std.Io.random(self.io, std.mem.asBytes(&seed));
+            self.viz = visualizer.Visualizer.init(self.allocator, bars, height, .waves, seed) catch return;
+        }
+        if (self.viz.?.bars != bars or self.viz.?.height != height) {
+            self.viz.?.resize(self.allocator, bars, height) catch return;
+        }
+
+        var window: [player_mod.VIZ_WINDOW]f32 = undefined;
+        const has_audio = self.player.vizWindow(&window);
+
+        _ = self.frame_arena.reset(.retain_capacity);
+        const alloc = self.frame_arena.allocator();
+        const lines = self.viz.?.render(alloc, if (has_audio) window[0..] else null, player_mod.SAMPLE_RATE) catch return;
+        for (lines, 0..) |line, i| {
+            if (i >= height) break;
+            term.moveTo(1 + i, 1);
+            term.text(line);
+        }
+        term.reset();
+    }
+
     fn drawStatus(self: *App, lay: Layout) void {
         const term = &self.term;
 
@@ -405,7 +451,7 @@ pub const App = struct {
         term.text(" ");
         term.textTrunc(status, lay.cols -| 45);
         term.text(" | ");
-        const hints = "↑↓nav Enter play s stop +/- vol v viz q quit";
+        const hints = "↑↓nav Enter play s stop +/- vol v viz f fullscreen q quit";
         term.textTrunc(hints, lay.cols);
         // Fill the rest of the row.
         var i: usize = 1 + @min(status.len, lay.cols -| 45) + 3 + @min(hints.len, lay.cols);
