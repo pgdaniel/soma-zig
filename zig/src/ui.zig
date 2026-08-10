@@ -3,6 +3,7 @@ const tui = @import("tui.zig");
 const channels_mod = @import("channels.zig");
 const player_mod = @import("player.zig");
 const visualizer = @import("visualizer.zig");
+const ipc = @import("ipc.zig");
 
 const Channel = channels_mod.Channel;
 const Player = player_mod.Player;
@@ -29,6 +30,9 @@ pub const App = struct {
     last_viz_ms: i64 = 0,
     fullscreen_viz: bool = false,
 
+    ipc: ipc.Server,
+    pre_mute_volume: ?u8 = null,
+
     status_buf: [256]u8 = undefined,
     status_len: usize = 0,
 
@@ -42,8 +46,10 @@ pub const App = struct {
             .client = .{ .allocator = allocator, .io = io },
             .channel_arena = std.heap.ArenaAllocator.init(allocator),
             .frame_arena = std.heap.ArenaAllocator.init(allocator),
+            .ipc = .{ .alloc = allocator },
         };
         self.setStatus("Loading SomaFM channels...");
+        self.ipc.start(allocator, io) catch {};
         return self;
     }
 
@@ -60,6 +66,9 @@ pub const App = struct {
     pub fn run(self: *App) !void {
         self.draw();
         self.loadChannels();
+
+        var ipc_cmds: std.ArrayList(ipc.Command) = .empty;
+        defer ipc_cmds.deinit(self.allocator);
 
         while (true) {
             if (self.term.pollKey(40)) |key| {
@@ -84,6 +93,13 @@ pub const App = struct {
                 }
                 self.draw();
             }
+            self.ipc.drain(&ipc_cmds);
+            if (ipc_cmds.items.len > 0) {
+                for (ipc_cmds.items) |cmd| self.applyCommand(cmd);
+                ipc_cmds.clearRetainingCapacity();
+                self.draw();
+            }
+            self.publishStatus();
             const now = std.Io.Clock.awake.now(self.io).toMilliseconds();
             if (now - self.last_viz_ms >= 80) {
                 self.last_viz_ms = now;
@@ -92,6 +108,101 @@ pub const App = struct {
         }
 
         self.player.stop();
+    }
+
+    // --------------------------------------------------------------
+    // IPC (see ipc.zig for the wire protocol)
+    // --------------------------------------------------------------
+    fn applyCommand(self: *App, cmd: ipc.Command) void {
+        switch (cmd) {
+            .vol_set => |v| {
+                self.volume = v;
+                self.player.setVolume(v);
+                self.pre_mute_volume = null;
+                var buf: [256]u8 = undefined;
+                self.setStatus(std.fmt.bufPrint(&buf, "Volume: {d}%", .{self.volume}) catch "Volume");
+            },
+            .vol_adj => |d| self.adjustVolume(d),
+            .mute_toggle => {
+                if (self.pre_mute_volume) |prev| {
+                    self.volume = prev;
+                    self.pre_mute_volume = null;
+                } else {
+                    self.pre_mute_volume = self.volume;
+                    self.volume = 0;
+                }
+                self.player.setVolume(self.volume);
+                self.setStatus(if (self.pre_mute_volume == null) "Unmuted" else "Muted");
+            },
+            .play_selected => self.playSelected(),
+            .play_id => |pid| {
+                const id = pid.buf[0..pid.len];
+                for (self.channels, 0..) |ch, i| {
+                    if (std.mem.eql(u8, ch.id, id)) {
+                        self.selected = i;
+                        self.playSelected();
+                        return;
+                    }
+                }
+                self.setStatus("Unknown channel id");
+            },
+            .stop => self.stopPlayback(),
+            .toggle => {
+                var ct: [128]u8 = undefined;
+                var tr: [256]u8 = undefined;
+                var msg: [256]u8 = undefined;
+                const snap = self.player.snapshot(&ct, &tr, &msg);
+                if (snap.playing or snap.connecting) self.stopPlayback() else self.playSelected();
+            },
+            .move => |d| self.moveSelection(d),
+            .surf => |d| {
+                self.moveSelection(d);
+                self.playSelected();
+            },
+            .viz_next => self.cycleViz(),
+        }
+    }
+
+    /// Publishes the one-line JSON status snapshot the IPC thread serves.
+    fn publishStatus(self: *App) void {
+        var ct: [128]u8 = undefined;
+        var tr: [256]u8 = undefined;
+        var msg: [256]u8 = undefined;
+        const snap = self.player.snapshot(&ct, &tr, &msg);
+        const channel: []const u8 = if (self.playing_idx) |pi| self.channels[pi].title else "";
+        const channel_id: []const u8 = if (self.playing_idx) |pi| self.channels[pi].id else "";
+
+        var buf: [768]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.writeAll("{\"playing\":") catch return;
+        w.writeAll(if (snap.playing) "true" else "false") catch return;
+        w.writeAll(",\"connecting\":") catch return;
+        w.writeAll(if (snap.connecting) "true" else "false") catch return;
+        w.writeAll(",\"channel\":\"") catch return;
+        writeJsonEscaped(&w, channel) catch return;
+        w.writeAll("\",\"channel_id\":\"") catch return;
+        writeJsonEscaped(&w, channel_id) catch return;
+        w.writeAll("\",\"track\":\"") catch return;
+        writeJsonEscaped(&w, snap.track) catch return;
+        w.print("\",\"volume\":{d}}}", .{self.volume}) catch return;
+        self.ipc.publishStatus(w.buffered());
+    }
+
+    fn writeJsonEscaped(w: *std.Io.Writer, s: []const u8) !void {
+        for (s) |ch| {
+            switch (ch) {
+                '"', '\\' => {
+                    try w.writeByte('\\');
+                    try w.writeByte(ch);
+                },
+                '\n' => try w.writeAll("\\n"),
+                else => {
+                    if (ch < 0x20) {
+                        try w.print("\\u{x:0>4}", .{ch});
+                    } else try w.writeByte(ch);
+                },
+            }
+        }
     }
 
     // --------------------------------------------------------------
