@@ -54,6 +54,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        self.ipc.shutdown();
         self.player.deinit();
         if (self.viz) |*v| v.deinit(self.allocator);
         self.client.deinit();

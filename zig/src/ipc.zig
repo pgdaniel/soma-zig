@@ -86,6 +86,17 @@ pub const Server = struct {
         thread.detach();
     }
 
+    /// Remove the socket file (clean shutdown, so clients don't hit a stale
+    /// path). The listener thread itself just dies with the process.
+    pub fn shutdown(self: *Server) void {
+        if (self.path_len == 0) return;
+        const path = self.path_buf[0..self.path_len];
+        var path_z: [109]u8 = undefined;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        _ = std.os.linux.unlink(@ptrCast(path_z[0..path.len :0].ptr));
+    }
+
     /// UI thread: swap the pending-command queue into `out` (must be empty).
     pub fn drain(self: *Server, out: *std.ArrayList(Command)) void {
         self.mtx.lockUncancelable(self.io);
