@@ -11,6 +11,12 @@ const Player = player_mod.Player;
 const HEADER_H = 4;
 const INFO_H = 8;
 
+const SortMode = enum {
+    default,
+    listeners,
+    genre,
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -25,6 +31,7 @@ pub const App = struct {
     scroll: usize = 0,
     playing_idx: ?usize = null,
     volume: u8 = 80,
+    sort_mode: SortMode = .default,
 
     viz: ?visualizer.Visualizer = null,
     last_viz_ms: i64 = 0,
@@ -84,6 +91,8 @@ pub const App = struct {
                         '-', '_' => self.adjustVolume(-5),
                         'v', 'V' => self.cycleViz(),
                         'f', 'F' => self.toggleFullscreenViz(),
+                        'l', 'L' => self.sortByListeners(),
+                        'g', 'G' => self.sortByGenre(),
                         else => {},
                     },
                     .up => self.moveSelection(-1),
@@ -287,6 +296,59 @@ pub const App = struct {
     fn toggleFullscreenViz(self: *App) void {
         self.fullscreen_viz = !self.fullscreen_viz;
         self.setStatus(if (self.fullscreen_viz) "Fullscreen visualizer" else "Normal view");
+    }
+
+    fn sortByListeners(self: *App) void {
+        if (self.channels.len == 0) return;
+        const playing_id = if (self.playing_idx) |idx| self.channels[idx].id else null;
+        const selected_id = self.channels[self.selected].id;
+        
+        std.mem.sort(Channel, self.channels, {}, struct {
+            fn lessThan(ctx: void, a: Channel, b: Channel) bool {
+                _ = ctx;
+                const a_num = std.fmt.parseInt(u32, a.listeners, 10) catch 0;
+                const b_num = std.fmt.parseInt(u32, b.listeners, 10) catch 0;
+                return a_num > b_num;
+            }
+        }.lessThan);
+        
+        self.updateIndicesAfterSort(playing_id, selected_id);
+        self.sort_mode = .listeners;
+        var buf: [256]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&buf, "Sorted by listeners", .{}) catch "Sorted by listeners");
+    }
+
+    fn sortByGenre(self: *App) void {
+        if (self.channels.len == 0) return;
+        const playing_id = if (self.playing_idx) |idx| self.channels[idx].id else null;
+        const selected_id = self.channels[self.selected].id;
+        
+        std.mem.sort(Channel, self.channels, {}, struct {
+            fn lessThan(ctx: void, a: Channel, b: Channel) bool {
+                _ = ctx;
+                return std.ascii.lessThanIgnoreCase(a.genre, b.genre);
+            }
+        }.lessThan);
+        
+        self.updateIndicesAfterSort(playing_id, selected_id);
+        self.sort_mode = .genre;
+        var buf: [256]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&buf, "Sorted by genre", .{}) catch "Sorted by genre");
+    }
+
+    fn updateIndicesAfterSort(self: *App, playing_id: ?[]const u8, selected_id: []const u8) void {
+        self.playing_idx = null;
+        for (self.channels, 0..) |ch, i| {
+            if (playing_id) |pid| {
+                if (std.mem.eql(u8, ch.id, pid)) {
+                    self.playing_idx = i;
+                }
+            }
+            if (std.mem.eql(u8, ch.id, selected_id)) {
+                self.selected = i;
+            }
+        }
+        self.scroll = 0;
     }
 
     fn setStatus(self: *App, msg: []const u8) void {
