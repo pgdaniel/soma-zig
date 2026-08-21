@@ -251,12 +251,7 @@ pub const App = struct {
             self.setStatus("Playback error");
             return;
         };
-        // Fresh visualizer with a random pattern, like the JS version.
         if (self.viz) |*v| {
-            var seed: u64 = undefined;
-            std.Io.random(self.io, std.mem.asBytes(&seed));
-            var rng = std.Random.DefaultPrng.init(seed);
-            v.pattern = visualizer.Pattern.random(rng.random());
             v.reset();
         }
         self.setStatus(std.fmt.bufPrint(&buf, "Now playing: {s}", .{ch.title}) catch "Now playing");
