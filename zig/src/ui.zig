@@ -620,7 +620,7 @@ pub const App = struct {
         term.text(" ");
         term.textTrunc(status, lay.cols -| 45);
         term.text(" | ");
-        const hints = "↑↓nav Enter play s stop +/- vol v viz f fullscreen q quit";
+        const hints = "↑↓nav Enter play s stop +/- vol v viz f fullscreen l listeners g genre q quit";
         term.textTrunc(hints, lay.cols);
         // Fill the rest of the row.
         var i: usize = 1 + @min(status.len, lay.cols -| 45) + 3 + @min(hints.len, lay.cols);
