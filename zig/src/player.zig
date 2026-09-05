@@ -157,6 +157,11 @@ pub const Player = struct {
         self.playing = false;
         self.connecting = false;
         self.state_mutex.unlock(self.io);
+        // Otherwise the last stream's ICY track title lingers in snapshot()
+        // (and so in the IPC status JSON) indefinitely after stopping,
+        // reading as "still playing" to anything showing it — play() clears
+        // it on the way in, but nothing previously cleared it on the way out.
+        self.setTrack("");
     }
 
     pub fn setVolume(self: *Player, vol: u8) void {
