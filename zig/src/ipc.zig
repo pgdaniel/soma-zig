@@ -15,7 +15,11 @@
 //!   surf-next / surf-prev → move selection and play
 //!   viz next          → cycle visualizer pattern
 //! Anything else gets "err unknown command".
+//!
+//! Also fronts the optional MQTT bridge (mqtt_bridge.zig, enabled by
+//! SOMA_MQTT_HOST), which feeds this same queue and reads the same status.
 const std = @import("std");
+const mqtt_bridge = @import("mqtt_bridge.zig");
 
 pub const Command = union(enum) {
     vol_set: u8,
@@ -84,6 +88,23 @@ pub const Server = struct {
 
         const thread = try std.Thread.spawn(.{}, loop, .{ self, io, path });
         thread.detach();
+        mqtt_bridge.start(self, alloc, io);
+    }
+
+    /// Queue a command for the UI thread (socket and MQTT both land here).
+    pub fn enqueue(self: *Server, cmd: Command) void {
+        self.mtx.lockUncancelable(self.io);
+        defer self.mtx.unlock(self.io);
+        self.queue.append(self.alloc, cmd) catch {};
+    }
+
+    /// Copy of the latest published status JSON (empty before the first frame).
+    pub fn statusSnapshot(self: *Server, out: []u8) []const u8 {
+        self.mtx.lockUncancelable(self.io);
+        defer self.mtx.unlock(self.io);
+        const n = @min(self.status_len, out.len);
+        @memcpy(out[0..n], self.status_buf[0..n]);
+        return out[0..n];
     }
 
     /// Remove the socket file (clean shutdown, so clients don't hit a stale
@@ -149,16 +170,12 @@ pub const Server = struct {
             w.flush() catch {};
             return;
         };
-        {
-            self.mtx.lockUncancelable(self.io);
-            defer self.mtx.unlock(self.io);
-            self.queue.append(self.alloc, cmd) catch {};
-        }
+        self.enqueue(cmd);
         w.writeAll("ok\n") catch {};
         w.flush() catch {};
     }
 
-    fn parseCommand(line: []const u8) ?Command {
+    pub fn parseCommand(line: []const u8) ?Command {
         if (std.mem.eql(u8, line, "mute")) return .mute_toggle;
         if (std.mem.eql(u8, line, "play")) return .play_selected;
         if (std.mem.eql(u8, line, "stop")) return .stop;
