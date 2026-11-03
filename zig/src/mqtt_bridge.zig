@@ -3,7 +3,7 @@
 //! the Unix socket. Started by ipc.Server.start when SOMA_MQTT_HOST is set;
 //! otherwise it does nothing.
 //!
-//! Environment: SOMA_MQTT_HOST (literal IP or "localhost"), SOMA_MQTT_PORT
+//! Environment: SOMA_MQTT_HOST (IP, "localhost" or a hostname), SOMA_MQTT_PORT
 //! (1883), SOMA_MQTT_USER / SOMA_MQTT_PASS, SOMA_MQTT_TOPIC (prefix, "soma").
 //!
 //! Commands (subscribed; <p> is the prefix):

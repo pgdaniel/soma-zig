@@ -3,7 +3,7 @@
 //! registers a retained last-will. Copied from deckd-zig's mqtt.zig (minus
 //! its one-shot publisher) — keep the two in step.
 //!
-//! Host must be a literal IP (or "localhost") — no DNS.
+//! Host may be an IP, "localhost", or a hostname (system resolver).
 const std = @import("std");
 
 /// Incoming PUBLISH callback. `topic`/`payload` are only valid for the call.
@@ -54,9 +54,7 @@ pub const Session = struct {
 
     fn connectAndRead(self: *Session) !void {
         if (self.host.len == 0) return error.NotConfigured;
-        const ip_txt = if (std.mem.eql(u8, self.host, "localhost")) "127.0.0.1" else self.host;
-        const addr = std.Io.net.IpAddress.parse(ip_txt, self.port) catch return error.BadHost;
-        const stream = addr.connect(self.io, .{ .mode = .stream }) catch return error.Offline;
+        const stream = try connectHost(self.io, self.host, self.port);
         defer stream.close(self.io);
 
         var rbuf: [4096]u8 = undefined;
@@ -160,6 +158,18 @@ pub const Session = struct {
         self.send(&.{ 0xC0, 0x00 }) catch {};
     }
 };
+
+/// Connect to a broker given as an IP literal, "localhost", or a hostname
+/// (resolved through the system resolver, so LAN names like
+/// "broker.attlocal.net" and mDNS "broker.local" work).
+fn connectHost(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
+    const lit = if (std.mem.eql(u8, host, "localhost")) "127.0.0.1" else host;
+    if (std.Io.net.IpAddress.parse(lit, port)) |addr| {
+        return addr.connect(io, .{ .mode = .stream }) catch error.Offline;
+    } else |_| {}
+    const name = std.Io.net.HostName.init(host) catch return error.BadHost;
+    return name.connect(io, port, .{ .mode = .stream }) catch error.Offline;
+}
 
 fn writeVarint(w: *std.Io.Writer, x: usize) !void {
     var v = x;
